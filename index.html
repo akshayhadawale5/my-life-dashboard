@@ -1401,13 +1401,19 @@ textarea:focus {
 
         </div>
 
-        <button
-            class="btn btn-primary"
-            onclick="openRosterModal()">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button
+                class="btn"
+                onclick="openRosterRangeModal()">
+                ＋ Assign Multiple Days
+            </button>
 
-            ＋ Add Roster
-
-        </button>
+            <button
+                class="btn btn-primary"
+                onclick="openRosterModal()">
+                ＋ Add Roster
+            </button>
+        </div>
 
     </div>
 
@@ -1949,7 +1955,7 @@ textarea:focus {
 ========================================================= */
 
 /* Put your deployed Apps Script /exec URL here. */
-const API_URL = "https://script.google.com/macros/s/AKfycbzTy2Aj4exnQOM27-mZcC6PeLnyGkV7zEpn7U-7NgAI3wvnoEYGpekrzR9EsCeSuxPN/exec";
+const API_URL = "https://script.google.com/macros/s/AKfycbxY6w86bB6JK18a7POWYL170BVsXH56qRHCSKLdJa2cj_KEl2zmjDsOEdAhHUN7YjI4/exec";
 const STORAGE_KEY = "myLifeDashboardV2";
 
 /* Google Identity Services configuration.
@@ -2621,7 +2627,7 @@ function nightOverlap(start, end) {
     );
 }
 
-function chooseSleepBlock(blocks, sleepMinutes) {
+function chooseSleepBlock(blocks, sleepMinutes, referenceTimeline = null) {
 
     const beforeSleep = Math.max(
         0,
@@ -2650,7 +2656,7 @@ function chooseSleepBlock(blocks, sleepMinutes) {
     }
 
     const currentShift = getShiftIdForDate(new Date());
-    const currentTimeline = getShiftTimeline(currentShift, 0);
+    const currentTimeline = referenceTimeline || getShiftTimeline(currentShift, 0);
 
     const candidates = [];
 
@@ -2799,6 +2805,297 @@ function getYouTubeDayData(video, key) {
         video.days[key] = { stage: VIDEO_STAGES[0], remark: "", done: false };
     }
     return video.days[key];
+}
+
+
+/*
+   CONTINUOUS 48-HOUR DASHBOARD TIMELINE
+   -------------------------------------
+   The dashboard Scroll is one continuous timeline:
+   selected day 00:00 -> next day 24:00.
+   Roster is the source of truth for both days.
+   Protected commitments (previous-day overnight continuation,
+   both shifts, travel, sleep and routines) are calculated together
+   so the second day cannot restart on top of an active sleep block.
+*/
+function createContinuousSchedule(date = new Date()) {
+    const startDate = new Date(date);
+    startDate.setHours(0, 0, 0, 0);
+
+    const nextDate = new Date(startDate);
+    nextDate.setDate(nextDate.getDate() + 1);
+
+    const previousDate = new Date(startDate);
+    previousDate.setDate(previousDate.getDate() - 1);
+
+    const startKey = dateKey(startDate);
+    const nextKey = dateKey(nextDate);
+    const previousKey = dateKey(previousDate);
+
+    const day0ShiftId = data.roster[startKey] || "MORNING";
+    const day1ShiftId = data.roster[nextKey] || "MORNING";
+    const previousShiftId = data.roster[previousKey] || "MORNING";
+
+    const day0Shift = getShift(day0ShiftId) || data.shifts[0];
+    const day1Shift = getShift(day1ShiftId) || data.shifts[0];
+    const previousShift = getShift(previousShiftId);
+
+    const schedule = [];
+    const fixed = [];
+
+    // Carry an overnight shift from the previous roster day into 00:00-06:00 etc.
+    if (previousShift && previousShift.id !== "OFF") {
+        addFixedShiftBlocks(schedule, fixed, previousShiftId, -1, true);
+    }
+
+    const day0Timeline = addFixedShiftBlocks(
+        schedule,
+        fixed,
+        day0ShiftId,
+        0,
+        true
+    );
+
+    const day1Timeline = addFixedShiftBlocks(
+        schedule,
+        fixed,
+        day1ShiftId,
+        1,
+        true
+    );
+
+    const sleepMinutes = Math.max(
+        6,
+        Number(data.settings.sleep) || 6
+    ) * 60;
+
+    const sleep = chooseSleepBlock(
+        fixed,
+        sleepMinutes,
+        day0Timeline
+    );
+
+    let sleepWarning = "";
+
+    if (sleep) {
+        addBlock(
+            schedule,
+            "prep-sleep",
+            "__FRESHEN_BEFORE_SLEEP_CONTINUOUS__",
+            "Freshen Up / Bath",
+            sleep.protectedStart,
+            sleep.sleepStart,
+            null,
+            null,
+            { dateKey: sleep.protectedStart >= 1440 ? nextKey : startKey }
+        );
+
+        addBlock(
+            schedule,
+            "sleep",
+            "__SLEEP_CONTINUOUS__",
+            "Sleep",
+            sleep.sleepStart,
+            sleep.sleepEnd,
+            null,
+            null,
+            { dateKey: sleep.sleepStart >= 1440 ? nextKey : startKey }
+        );
+
+        addBlock(
+            schedule,
+            "routine",
+            "__ROUTINE_AFTER_SLEEP_CONTINUOUS__",
+            "Get Fresh / Morning Routine",
+            sleep.sleepEnd,
+            sleep.afterEnd,
+            null,
+            null,
+            { dateKey: sleep.sleepEnd >= 1440 ? nextKey : startKey }
+        );
+
+        fixed.push({
+            start: sleep.protectedStart,
+            end: sleep.afterEnd
+        });
+    } else {
+        sleepWarning =
+            "A full protected sleep block could not be placed around the selected day's roster and the next day's roster. Sleep should take priority over lower-priority activities.";
+    }
+
+    const priority = { High: 1, Medium: 2, Low: 3 };
+    const dailyTasks = data.tasks
+        .filter(task => task.active && task.frequency === "Daily")
+        .sort((a, b) => (priority[a.priority] || 9) - (priority[b.priority] || 9));
+
+    const scheduleDay = (dayOffset, dayDate, dayKey) => {
+        const dayStart = dayOffset * 1440;
+        const dayEnd = dayStart + 1440;
+
+        // One-off tasks already placed by the user on this calendar date.
+        const customTasks = (data.customTasks && data.customTasks[dayKey])
+            ? data.customTasks[dayKey]
+            : [];
+
+        for (const custom of customTasks) {
+            const start = Number(custom.start) + dayStart;
+            const duration = Number(custom.duration);
+            if (!Number.isFinite(start) || !Number.isFinite(duration) || duration <= 0) continue;
+
+            addBlock(
+                schedule,
+                "custom",
+                custom.id,
+                custom.name,
+                start,
+                start + duration,
+                duration,
+                custom,
+                { dateKey: dayKey }
+            );
+
+            fixed.push({ start, end: start + duration });
+        }
+
+        for (const task of dailyTasks) {
+            const duration = Number(task.duration) || 0;
+            if (!duration) continue;
+
+            const localConstraintStart = task.timeConstraint === "window"
+                ? timeToMinutes(task.timeStart || "09:00")
+                : 0;
+            const localConstraintEnd = task.timeConstraint === "window"
+                ? timeToMinutes(task.timeEnd || "18:00")
+                : 1440;
+
+            const constraintStart = dayStart + localConstraintStart;
+            const constraintEnd = dayStart + localConstraintEnd;
+
+            if (!Number.isFinite(constraintStart) || !Number.isFinite(constraintEnd) || constraintEnd <= constraintStart) {
+                continue;
+            }
+
+            const gaps = freeIntervals(fixed, constraintStart, constraintEnd);
+            let placed = false;
+
+            for (const gap of gaps) {
+                const transition = gap.start === constraintStart ? 0 : 15;
+                const start = gap.start + transition;
+                const end = start + duration;
+
+                if (end > gap.end) continue;
+                if (fixed.some(block => overlaps(start, end, block.start, block.end))) continue;
+
+                addBlock(
+                    schedule,
+                    "task",
+                    task.id,
+                    task.name,
+                    start,
+                    end,
+                    duration,
+                    task,
+                    { dateKey: dayKey }
+                );
+
+                fixed.push({ start, end });
+                placed = true;
+                break;
+            }
+
+            if (!placed) {
+                addBlock(
+                    schedule,
+                    "unscheduled",
+                    `${task.id}_${dayKey}`,
+                    task.name,
+                    -1,
+                    -1,
+                    duration,
+                    task,
+                    { dateKey: dayKey }
+                );
+            }
+        }
+
+        const youtubeProjects = data.videos.filter(video =>
+            video.week && isoWeekKey(dayDate) === video.week
+        );
+
+        for (const video of youtubeProjects) {
+            const dayData = getYouTubeDayData(video, dayKey);
+            const duration = 60;
+            const gaps = freeIntervals(fixed, dayStart, dayEnd);
+            let placed = false;
+
+            for (const gap of gaps) {
+                const start = gap.start + (gap.start === dayStart ? 0 : 15);
+                const end = start + duration;
+                if (end > gap.end) continue;
+                if (fixed.some(block => overlaps(start, end, block.start, block.end))) continue;
+
+                addBlock(
+                    schedule,
+                    "youtube",
+                    `YOUTUBE_${video.id}_${dayKey}`,
+                    `YouTube — ${video.title}`,
+                    start,
+                    end,
+                    duration,
+                    null,
+                    {
+                        videoId: video.id,
+                        stage: dayData.stage,
+                        remark: dayData.remark,
+                        dateKey: dayKey
+                    }
+                );
+                fixed.push({ start, end });
+                placed = true;
+                break;
+            }
+
+            if (!placed) {
+                addBlock(
+                    schedule,
+                    "unscheduled",
+                    `YOUTUBE_${video.id}_${dayKey}`,
+                    `YouTube — ${video.title}`,
+                    -1,
+                    -1,
+                    duration,
+                    null,
+                    { videoId: video.id, stage: dayData.stage, remark: dayData.remark, dateKey: dayKey }
+                );
+            }
+        }
+
+        addFreeBlocks(schedule, fixed, dayStart, dayEnd);
+    };
+
+    scheduleDay(0, startDate, startKey);
+    scheduleDay(1, nextDate, nextKey);
+
+    schedule.sort((a, b) => {
+        const aa = a.start < 0 ? 999999 : a.start;
+        const bb = b.start < 0 ? 999999 : b.start;
+        return aa - bb;
+    });
+
+    return {
+        shift: day0Shift,
+        items: schedule,
+        todayShiftId: day0ShiftId,
+        tomorrowShiftId: day1ShiftId,
+        yesterdayShiftId: previousShiftId,
+        tomorrowShiftName: day1Shift ? day1Shift.name : "Off Day",
+        yesterdayShiftName: previousShift ? previousShift.name : "Off Day",
+        sleep,
+        sleepProtected: !!sleep,
+        sleepWarning,
+        day0Timeline,
+        day1Timeline
+    };
 }
 
 function createSchedule(date = new Date()) {
@@ -3580,44 +3877,74 @@ function renderCurrentTask(schedule) {
    TASK LIST
 ========================================================= */
 
-function renderTaskList(schedule, tomorrowSchedule = null) {
+function renderTaskList(schedule) {
     const container = document.getElementById("taskList");
     if (!container) return;
     container.classList.add("timeline-scroll");
 
-    const renderItems = (items, scheduleForStatus, label) => {
-        const rows = (items || []).map(item => {
-            const status = getTaskStatus(item, scheduleForStatus);
-            let dotClass = "dot-grey";
-            let badge = "";
-            if (status === "current") { dotClass = "dot-green"; badge = `<span class="status status-green">NOW</span>`; }
-            else if (status === "upcoming") { dotClass = "dot-blue"; badge = `<span class="status status-blue">UPCOMING</span>`; }
-            else if (status === "done") { dotClass = "dot-green"; badge = `<span class="status status-green">DONE</span>`; }
-            else if (status === "missed") { dotClass = "dot-red"; badge = `<span class="status status-red">MISSED</span>`; }
-            else if (item.type === "sleep") { dotClass = "dot-green"; badge = `<span class="status status-green">PROTECTED</span>`; }
-            else if (item.type === "work") { dotClass = "dot-blue"; badge = `<span class="status status-blue">FIXED</span>`; }
-            else if (item.type === "travel") { dotClass = "dot-blue"; badge = `<span class="status status-blue">CAB</span>`; }
-            else if (item.type === "prep" || item.type === "prep-sleep" || item.type === "routine") { dotClass = "dot-blue"; badge = `<span class="status status-blue">BUFFER</span>`; }
-            else if (item.type === "free") { dotClass = "dot-grey"; badge = `<span class="status status-blue">FREE</span>`; }
+    if (!schedule.items || !schedule.items.length) {
+        container.innerHTML = `<div class="empty">No activities scheduled.</div>`;
+        return;
+    }
 
-            const action = (item.type === "task" || item.type === "custom") && status !== "done"
-                ? `<button class="icon-button" onclick="completeTask('${escapeHtml(item.id)}', '${escapeHtml(item.dateKey || selectedScheduleDate)}')">✓</button>` : "";
-            const freeAction = item.type === "free" ? `<button class="btn btn-primary" onclick="addTaskToFreeSlot(${item.start}, ${item.end})">＋ Add Task</button>` : "";
-            const youtubeAction = item.type === "youtube" ? `<button class="btn" onclick="showPage('youtube')">Manage</button>` : "";
-            return `<div class="task-row">
-                <span class="dot ${dotClass}"></span>
-                <div class="task-info">
-                    <div class="task-name">${escapeHtml(item.name)} ${badge}</div>
-                    <div class="task-meta">${item.start >= 0 ? `${formatTime(minutesToTime(item.start))} → ${formatTime(minutesToTime(item.end))}` : "Not scheduled"} • ${formatDuration(item.duration)}</div>
-                </div>
-                <div class="task-actions">${freeAction}${youtubeAction}${action}</div>
-            </div>`;
-        }).join("");
-        return `<div class="timeline-day-marker ${label === "Tomorrow" ? "tomorrow" : ""}">${label}</div>${rows}`;
+    const visibleItems = schedule.items.filter(item =>
+        (item.start >= 0 && item.end > 0 && item.start < 2880) ||
+        item.type === "unscheduled"
+    );
+
+    const renderItem = item => {
+        const status = getTaskStatus(item, schedule);
+        let dotClass = "dot-grey";
+        let badge = "";
+
+        if (status === "current") { dotClass = "dot-green"; badge = `<span class="status status-green">NOW</span>`; }
+        else if (status === "upcoming") { dotClass = "dot-blue"; badge = `<span class="status status-blue">UPCOMING</span>`; }
+        else if (status === "done") { dotClass = "dot-green"; badge = `<span class="status status-green">DONE</span>`; }
+        else if (status === "missed") { dotClass = "dot-red"; badge = `<span class="status status-red">MISSED</span>`; }
+        else if (item.type === "sleep") { dotClass = "dot-green"; badge = `<span class="status status-green">PROTECTED</span>`; }
+        else if (item.type === "work") { dotClass = "dot-blue"; badge = `<span class="status status-blue">FIXED</span>`; }
+        else if (item.type === "travel") { dotClass = "dot-blue"; badge = `<span class="status status-blue">CAB</span>`; }
+        else if (item.type === "prep" || item.type === "prep-sleep" || item.type === "routine") { dotClass = "dot-blue"; badge = `<span class="status status-blue">BUFFER</span>`; }
+        else if (item.type === "free") { dotClass = "dot-grey"; badge = `<span class="status status-blue">FREE</span>`; }
+
+        const completionDate = item.dateKey || selectedScheduleDate;
+        const action = (item.type === "task" || item.type === "custom") && status !== "done"
+            ? `<button class="icon-button" onclick="completeTask('${escapeHtml(item.id)}', '${escapeHtml(completionDate)}')">✓</button>`
+            : "";
+
+        // Free-time editing remains tied to the selected calendar day.
+        // This preserves the existing custom-task behavior.
+        const freeAction = item.type === "free"
+            ? `<button class="btn btn-primary" onclick="addTaskToFreeSlot(${item.start % 1440}, ${item.end % 1440})">＋ Add Task</button>`
+            : "";
+
+        const youtubeAction = item.type === "youtube"
+            ? `<button class="btn" onclick="showPage('youtube')">Manage</button>`
+            : "";
+
+        return `<div class="task-row">
+            <span class="dot ${dotClass}"></span>
+            <div class="task-info">
+                <div class="task-name">${escapeHtml(item.name)} ${badge}</div>
+                <div class="task-meta">${item.start >= 0 ? `${formatTime(minutesToTime(item.start))} → ${formatTime(minutesToTime(item.end))}` : "Not scheduled"} • ${formatDuration(item.duration)}</div>
+            </div>
+            <div class="task-actions">${freeAction}${youtubeAction}${action}</div>
+        </div>`;
     };
 
-    container.innerHTML = renderItems(schedule.items, schedule, "Today") +
-        (tomorrowSchedule ? renderItems(tomorrowSchedule.items, tomorrowSchedule, "Tomorrow") : "");
+    let html = "";
+    let currentSection = null;
+
+    for (const item of visibleItems) {
+        const section = item.start >= 1440 ? "Tomorrow" : "Today";
+        if (section !== currentSection) {
+            currentSection = section;
+            html += `<div class="timeline-day-marker ${section === "Tomorrow" ? "tomorrow" : ""}">${section}</div>`;
+        }
+        html += renderItem(item);
+    }
+
+    container.innerHTML = html || `<div class="empty">No activities scheduled.</div>`;
 }
 
 
@@ -4532,6 +4859,80 @@ function openRosterModal(
 
     );
 
+}
+
+
+function openRosterRangeModal() {
+    const today = dateKey(new Date());
+
+    openModal(
+        "Assign Shift to Multiple Days",
+        `
+        <div class="task-meta" style="margin-bottom:14px;line-height:1.6;">
+            Select a shift and a date range. The same shift will be assigned to every date in that range.
+            This updates the Roster only; the scheduler will automatically recalculate around the new roster.
+        </div>
+
+        <div class="form-grid">
+            <div class="form-group">
+                <label>Start Date</label>
+                <input id="rosterRangeStart" type="date" value="${today}">
+            </div>
+
+            <div class="form-group">
+                <label>End Date</label>
+                <input id="rosterRangeEnd" type="date" value="${today}">
+            </div>
+
+            <div class="form-group" style="grid-column:1/-1;">
+                <label>Shift</label>
+                <select id="rosterRangeShift">
+                    ${data.shifts.map(shift => `
+                        <option value="${escapeHtml(shift.id)}">${escapeHtml(shift.name)}</option>
+                    `).join("")}
+                </select>
+            </div>
+        </div>
+
+        <br>
+        <button class="btn btn-primary" onclick="saveRosterRange()">
+            Apply Shift to Date Range
+        </button>
+        `
+    );
+}
+
+function saveRosterRange() {
+    const startValue = document.getElementById("rosterRangeStart")?.value;
+    const endValue = document.getElementById("rosterRangeEnd")?.value;
+    const shift = document.getElementById("rosterRangeShift")?.value;
+
+    if (!startValue || !endValue || !shift) {
+        showToast("Please select start date, end date and shift.");
+        return;
+    }
+
+    const start = new Date(startValue + "T00:00:00");
+    const end = new Date(endValue + "T00:00:00");
+
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+        showToast("End date must be the same as or after start date.");
+        return;
+    }
+
+    let count = 0;
+    const cursor = new Date(start);
+
+    while (cursor <= end) {
+        data.roster[dateKey(cursor)] = shift;
+        count++;
+        cursor.setDate(cursor.getDate() + 1);
+    }
+
+    saveData();
+    closeModal();
+    showToast(`${count} roster day${count === 1 ? "" : "s"} updated ✓`);
+    renderAll();
 }
 
 
@@ -6199,9 +6600,7 @@ function renderDashboard() {
     }
 
     const schedule = createSchedule(selectedDate);
-    const nextDate = new Date(selectedDate);
-    nextDate.setDate(nextDate.getDate() + 1);
-    const tomorrowSchedule = createSchedule(nextDate);
+    const continuousSchedule = createContinuousSchedule(selectedDate);
     const contextEl = document.getElementById("scheduleContext");
     if (contextEl) {
         contextEl.innerHTML = `
@@ -6213,11 +6612,11 @@ function renderDashboard() {
 
     const planTitle = document.querySelector("#dashboard .card-title");
     if (planTitle) {
-        planTitle.textContent = isSelectedToday() ? "Today's Plan" : `${formatDate(selectedDate)} Plan`;
+        planTitle.textContent = isSelectedToday() ? "Today's Plan + Tomorrow" : `${formatDate(selectedDate)} Plan + Next Day`;
     }
 
-    renderCurrentTask(schedule);
-    renderTaskList(schedule, tomorrowSchedule);
+    renderCurrentTask(continuousSchedule);
+    renderTaskList(continuousSchedule);
     renderDailyProgress(selectedKey);
     renderDashboardReminders();
 }
